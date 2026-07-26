@@ -1,0 +1,279 @@
+openapi: 3.0.3
+info:
+  title: Audit Service API
+  version: 1.0.0
+  description: API for collecting and analyzing user action events with PostgreSQL and Apache Kafka.
+servers:
+  - url: http://localhost:8080
+
+paths:
+  /health:
+    get:
+      summary: Check service health
+      responses:
+        "200":
+          description: Service is running
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  /api/audit:
+    post:
+      summary: Record a user action
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateAuditRequest"
+      responses:
+        "201":
+          description: Event was stored in PostgreSQL and published to Kafka
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreateAuditResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+    get:
+      summary: Get a user's action history
+      parameters:
+        - name: user_id
+          in: query
+          required: true
+          schema:
+            type: string
+        - name: action
+          in: query
+          schema:
+            $ref: "#/components/schemas/Action"
+        - name: from
+          in: query
+          description: Inclusive start date in UTC
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          description: Inclusive end date in UTC
+          schema:
+            type: string
+            format: date
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 50
+      responses:
+        "200":
+          description: Paginated user history
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/HistoryResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/stats:
+    get:
+      summary: Get aggregate statistics from PostgreSQL
+      description: In a streaming architecture this aggregation could be maintained with Kafka Streams or ksqlDB.
+      parameters:
+        - name: user_id
+          in: query
+          required: false
+          schema:
+            type: string
+        - name: group_by
+          in: query
+          required: true
+          schema:
+            type: string
+            enum: [action, day]
+      responses:
+        "200":
+          description: Aggregate statistics
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/StatsResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+  /api/admin/rebuild-stats:
+    post:
+      summary: Rebuild statistics by replaying Kafka events
+      description: Uses an independent consumer and does not modify analytics-group offsets.
+      parameters:
+        - name: from
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: to
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+      responses:
+        "200":
+          description: Replay completed
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ReplayResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalError"
+
+components:
+  schemas:
+    Action:
+      type: string
+      enum: [login, view, purchase]
+
+    CreateAuditRequest:
+      type: object
+      additionalProperties: false
+      required: [user_id, action, resource_id]
+      properties:
+        user_id:
+          type: string
+          minLength: 1
+        action:
+          $ref: "#/components/schemas/Action"
+        resource_id:
+          type: string
+          minLength: 1
+        meta:
+          type: object
+          additionalProperties: true
+          default: {}
+
+    CreateAuditResponse:
+      type: object
+      required: [event_id, timestamp]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        timestamp:
+          type: string
+          format: date-time
+
+    AuditEvent:
+      type: object
+      required: [event_id, action, resource_id, meta, timestamp]
+      properties:
+        event_id:
+          type: string
+          format: uuid
+        action:
+          $ref: "#/components/schemas/Action"
+        resource_id:
+          type: string
+        meta:
+          type: object
+          additionalProperties: true
+        timestamp:
+          type: string
+          format: date-time
+
+    HistoryResponse:
+      type: object
+      required: [items, page, limit, total]
+      properties:
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/AuditEvent"
+        page:
+          type: integer
+        limit:
+          type: integer
+        total:
+          type: integer
+          format: int64
+
+    Stat:
+      type: object
+      required: [group, count]
+      properties:
+        group:
+          type: string
+        count:
+          type: integer
+          format: int64
+
+    StatsResponse:
+      type: object
+      required: [group_by, items]
+      properties:
+        group_by:
+          type: string
+          enum: [action, day]
+        items:
+          type: array
+          items:
+            $ref: "#/components/schemas/Stat"
+
+    ReplayResponse:
+      type: object
+      required: [from, to, events_processed, stats]
+      properties:
+        from:
+          type: string
+          format: date-time
+        to:
+          type: string
+          format: date-time
+        events_processed:
+          type: integer
+          format: int64
+        stats:
+          type: array
+          items:
+            $ref: "#/components/schemas/Stat"
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+
+  responses:
+    BadRequest:
+      description: Request validation failed
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
+    InternalError:
+      description: Internal server error
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
