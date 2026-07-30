@@ -98,7 +98,7 @@ paths:
       parameters:
         - name: user_id
           in: query
-          required: false
+          required: true
           schema:
             type: string
         - name: group_by
@@ -122,7 +122,7 @@ paths:
   /api/admin/rebuild-stats:
     post:
       summary: Rebuild statistics by replaying Kafka events
-      description: Uses an independent consumer and does not modify analytics-group offsets.
+      description: Returns an independent historical result and does not modify analytics-group offsets or the rolling stats cache.
       parameters:
         - name: from
           in: query

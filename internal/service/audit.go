@@ -16,23 +16,17 @@ import (
 var ErrValidation = errors.New("validation error")
 
 type EventRepository interface {
-	SaveEvent(context.Context, domain.Event) error
-	DeleteEvent(context.Context, string) error
+	SaveEventWithOutbox(context.Context, domain.Event) error
 	History(context.Context, domain.HistoryFilter) ([]domain.Event, int64, error)
 	Stats(context.Context, string, string) ([]domain.Stat, error)
 }
 
-type EventProducer interface {
-	SendEvent(context.Context, domain.Event) error
-}
-
 type AuditService struct {
 	repository EventRepository
-	producer   EventProducer
 }
 
-func NewAuditService(repository EventRepository, producer EventProducer) *AuditService {
-	return &AuditService{repository: repository, producer: producer}
+func NewAuditService(repository EventRepository) *AuditService {
+	return &AuditService{repository: repository}
 }
 
 func (s *AuditService) CreateEvent(
@@ -70,13 +64,7 @@ func (s *AuditService) CreateEvent(
 		Timestamp:  time.Now().UTC(),
 	}
 
-	if err := s.repository.SaveEvent(ctx, event); err != nil {
-		return domain.Event{}, err
-	}
-	if err := s.producer.SendEvent(ctx, event); err != nil {
-		if rollbackErr := s.repository.DeleteEvent(ctx, event.EventID.String()); rollbackErr != nil {
-			return domain.Event{}, fmt.Errorf("%v; rollback database event: %w", err, rollbackErr)
-		}
+	if err := s.repository.SaveEventWithOutbox(ctx, event); err != nil {
 		return domain.Event{}, err
 	}
 
@@ -118,6 +106,9 @@ func (s *AuditService) Stats(
 ) ([]domain.Stat, error) {
 	userID = strings.TrimSpace(userID)
 	groupBy = strings.TrimSpace(groupBy)
+	if userID == "" {
+		return nil, fmt.Errorf("%w: user_id is required", ErrValidation)
+	}
 	if groupBy != "action" && groupBy != "day" {
 		return nil, fmt.Errorf("%w: group_by must be action or day", ErrValidation)
 	}

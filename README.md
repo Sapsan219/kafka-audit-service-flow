@@ -1,75 +1,77 @@
 # Audit Service
 
 Микросервис аудита пользовательских действий на Go, PostgreSQL и Apache Kafka.
-События сохраняются в `audit_log` и публикуются в Kafka с ключом `user_id`,
-чтобы действия одного пользователя попадали в одну партицию и сохраняли порядок.
 
-## Возможности
+Сервис принимает события `login`, `view` и `purchase`, хранит их в PostgreSQL,
+публикует в Kafka и поддерживает агрегаты за последний час.
 
-- запись действий `login`, `view` и `purchase`;
-- история пользователя с фильтрацией и пагинацией;
-- статистика по действиям или UTC-дням;
-- периодическое обновление `stats_cache` consumer-группой `analytics-group`;
-- ручной replay событий Kafka за выбранный период;
-- Swagger/OpenAPI и интеграционный тест с Testcontainers.
-
-## Архитектура
+## Поток события
 
 ```text
 POST /api/audit
-    ├── PostgreSQL: audit_log
-    └── Kafka: user-actions (3 partitions, key=user_id)
-                           │
-                           ▼
-                    analytics-group
-                           │
-                           ▼
-                     stats_cache
+        |
+        v
+PostgreSQL transaction
+  ├── audit_log
+  └── outbox_events
+        |
+        v
+outbox publisher
+        |
+        v
+Kafka: user-actions (3 partitions, key=user_id)
+        |
+        v
+analytics-group
+  ├── analytics_events
+  └── stats_cache
 
-GET  /api/audit ──────────────── PostgreSQL
-GET  /api/stats ──────────────── PostgreSQL
-POST /api/admin/rebuild-stats ── Kafka replay ── stats_cache
+Некорректное сообщение ──> Kafka: user-actions-dlq
 ```
 
-Kafka работает в режиме KRaft без ZooKeeper. Docker Compose поднимает Kafka и
-PostgreSQL, создаёт топик `user-actions` с тремя партициями и применяет миграцию.
-Go-приложение запускается отдельно на хосте.
+`audit_log` и `outbox_events` создаются в одной транзакции. Поэтому событие не
+может сохраниться без задачи на публикацию. Publisher повторяет неуспешные
+отправки, что даёт доставку at-least-once.
 
-## Быстрый запуск
+Consumer сохраняет прочитанные Kafka-события в `analytics_events`, обновляет
+`stats_cache` и только после успешной транзакции коммитит offsets. Повторная
+доставка безопасна: `analytics_events.event_id` является первичным ключом.
 
-Требуются Go 1.25+, Docker Desktop и свободные порты `8080`, `9092`, `5433`.
+Ручной replay использует независимый consumer без group ID. Он возвращает
+исторический результат в HTTP-ответе, не изменяет offsets `analytics-group` и не
+перезаписывает текущий часовой `stats_cache`.
 
-```bash
+## Запуск
+
+Требуются Go 1.25+ и Docker Desktop.
+
+```powershell
+Copy-Item .env.example .env
 docker compose up -d
-docker compose ps -a
 go run ./cmd/audit-service
 ```
 
-`kafka` и `postgres` должны иметь статус `healthy`. Контейнеры `kafka-init` и
-`postgres-init` выполняются один раз, поэтому для них нормален статус `Exited (0)`.
+Проверка:
 
-Проверка сервиса:
-
-```bash
-curl http://localhost:8080/health
+```powershell
+Invoke-RestMethod http://localhost:8080/health
 ```
 
 Swagger UI: <http://localhost:8080/swagger/>
 
-OpenAPI: <http://localhost:8080/swagger/openapi.yaml>
-
-PostgreSQL доступен на хосте через порт `5433`; внутри Docker используется
-стандартный порт `5432`.
+PostgreSQL доступен на хосте через порт `5433`, Kafka — через `9092`.
+Контейнеры `kafka-init`, `kafka-dlq-init` и `postgres-init` завершаются с кодом
+`0` после создания топиков и применения миграции.
 
 ## API
 
 | Метод | Маршрут | Назначение |
 |---|---|---|
-| `POST` | `/api/audit` | Сохранить событие в PostgreSQL и отправить в Kafka |
-| `GET` | `/api/audit` | Получить историю пользователя с фильтрами и пагинацией |
-| `GET` | `/api/stats` | Сгруппировать события по `action` или `day` |
-| `POST` | `/api/admin/rebuild-stats` | Пересчитать статистику через Kafka replay |
-| `GET` | `/health` | Проверить доступность сервиса |
+| `POST` | `/api/audit` | Записать пользовательское действие |
+| `GET` | `/api/audit` | История с фильтрацией и пагинацией |
+| `GET` | `/api/stats` | Статистика пользователя по `action` или `day` |
+| `POST` | `/api/admin/rebuild-stats` | Replay Kafka за выбранный период |
+| `GET` | `/health` | Проверка сервиса |
 
 Пример события:
 
@@ -84,53 +86,53 @@ PostgreSQL доступен на хосте через порт `5433`; внут
 }
 ```
 
-Поля `user_id`, `action` и `resource_id` обязательны. `meta` необязательно и по
-умолчанию равно `{}`. Полные схемы запросов и ответов находятся в Swagger.
+Для `/api/stats` параметры `user_id` и `group_by` обязательны.
 
 ## Конфигурация
+
+Основные переменные:
 
 | Переменная | Значение по умолчанию |
 |---|---|
 | `HTTP_ADDR` | `:8080` |
+| `HTTP_READ_TIMEOUT` | `10s` |
+| `HTTP_WRITE_TIMEOUT` | `15s` |
+| `HTTP_IDLE_TIMEOUT` | `60s` |
 | `DATABASE_URL` | `postgres://audit:audit@127.0.0.1:5433/audit?sslmode=disable` |
 | `KAFKA_BROKERS` | `localhost:9092` |
 | `KAFKA_TOPIC` | `user-actions` |
+| `KAFKA_DLQ_TOPIC` | `user-actions-dlq` |
 | `KAFKA_GROUP_ID` | `analytics-group` |
 | `KAFKA_BATCH_SIZE` | `100` |
+| `KAFKA_PRODUCER_TIMEOUT` | `10s` |
 | `KAFKA_COMMIT_INTERVAL` | `5s` |
 | `ANALYTICS_INTERVAL` | `5m` |
+| `OUTBOX_INTERVAL` | `1s` |
+| `OUTBOX_BATCH_SIZE` | `100` |
 | `SHUTDOWN_PERIOD` | `10s` |
 
-Пример значений находится в `.env.example`. Приложение читает переменные
-окружения; файл `.env` автоматически не загружается.
+Docker Compose также читает `POSTGRES_DB`, `POSTGRES_USER`,
+`POSTGRES_PASSWORD` и `POSTGRES_HOST_PORT` из `.env`.
 
 ## Тесты
 
-Обычные тесты:
+Unit-тесты:
 
-```bash
+```powershell
 go test ./...
 ```
 
-Интеграционный тест producer → Kafka → consumer:
+Полный integration flow через Testcontainers:
 
-```bash
+```powershell
 go test -tags=integration ./tests/integration -v -count=1
 ```
 
-Интеграционный тест через Testcontainers запускает временную Kafka, создаёт
-топик с тремя партициями и проверяет ключ и содержимое доставленного события.
+Integration-тест поднимает временные Kafka и PostgreSQL и проверяет цепочку:
 
-## Документация кода
-
-Подробный разбор файлов, offsets, rebalance и replay:
-[docs/code-walkthrough.md](docs/code-walkthrough.md).
-
-## Остановка
-
-```bash
-docker compose down
+```text
+AuditService -> outbox -> producer -> consumer group
+             -> analytics_events -> stats_cache -> committed offset
 ```
 
-Команда сохраняет PostgreSQL volume. `docker compose down -v` также удаляет
-volume и все локальные данные проекта.
+Подробное объяснение реализации: [docs/code-walkthrough.md](docs/code-walkthrough.md).

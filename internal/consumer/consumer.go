@@ -3,6 +3,7 @@ package consumer
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
@@ -14,7 +15,11 @@ import (
 )
 
 type StatsRepository interface {
-	RefreshStatsCache(context.Context, time.Time, time.Time) error
+	StoreAnalyticsAndRefresh(context.Context, []domain.Event, time.Time, time.Time) error
+}
+
+type DeadLetterProducer interface {
+	SendDeadLetter(context.Context, *sarama.ConsumerMessage, error) error
 }
 
 type Config struct {
@@ -30,11 +35,13 @@ type Consumer struct {
 	group   sarama.ConsumerGroup
 	topic   string
 	handler *groupHandler
+	log     *slog.Logger
 }
 
 func New(
 	settings Config,
 	repository StatsRepository,
+	dlq DeadLetterProducer,
 	log *slog.Logger,
 ) (*Consumer, error) {
 	cfg := sarama.NewConfig()
@@ -55,10 +62,12 @@ func New(
 		topic: settings.Topic,
 		handler: &groupHandler{
 			repository:        repository,
+			dlq:               dlq,
 			log:               log,
 			analyticsInterval: settings.AnalyticsInterval,
 			batchSize:         settings.BatchSize,
 		},
+		log: log,
 	}, nil
 }
 
@@ -68,7 +77,12 @@ func (c *Consumer) Run(ctx context.Context) error {
 			if ctx.Err() != nil {
 				return nil
 			}
-			return fmt.Errorf("consume Kafka messages: %w", err)
+			c.log.Error("consume Kafka messages; retrying", "error", err)
+			select {
+			case <-ctx.Done():
+				return nil
+			case <-time.After(time.Second):
+			}
 		}
 	}
 	return nil
@@ -80,12 +94,19 @@ func (c *Consumer) Close() error {
 
 type groupHandler struct {
 	repository        StatsRepository
+	dlq               DeadLetterProducer
 	log               *slog.Logger
 	analyticsInterval time.Duration
 	batchSize         int
 
-	mu      sync.Mutex
-	pending []*sarama.ConsumerMessage
+	mu          sync.Mutex
+	pending     []pendingMessage
+	lastRefresh time.Time
+}
+
+type pendingMessage struct {
+	message *sarama.ConsumerMessage
+	event   domain.Event
 }
 
 func (h *groupHandler) Setup(session sarama.ConsumerGroupSession) error {
@@ -105,7 +126,7 @@ func (h *groupHandler) Cleanup(session sarama.ConsumerGroupSession) error {
 		"generation_id", session.GenerationID(),
 		"partitions", session.Claims(),
 	)
-	return h.flush(session)
+	return h.flush(session, true)
 }
 
 func (h *groupHandler) ConsumeClaim(
@@ -119,19 +140,21 @@ func (h *groupHandler) ConsumeClaim(
 		select {
 		case message, ok := <-claim.Messages():
 			if !ok {
-				return h.flush(session)
+				return h.flush(session, true)
 			}
 
 			var event domain.Event
 			if err := json.Unmarshal(message.Value, &event); err != nil {
-				h.log.Error(
-					"decode Kafka message",
-					"error", err,
-					"key", string(message.Key),
-					"partition", message.Partition,
-					"offset", message.Offset,
-				)
-				return fmt.Errorf("decode Kafka message at partition %d offset %d: %w", message.Partition, message.Offset, err)
+				if err := h.sendToDLQ(session, message, fmt.Errorf("decode JSON: %w", err)); err != nil {
+					return err
+				}
+				continue
+			}
+			if err := validateEvent(event); err != nil {
+				if err := h.sendToDLQ(session, message, err); err != nil {
+					return err
+				}
+				continue
 			}
 
 			h.log.Info(
@@ -143,52 +166,116 @@ func (h *groupHandler) ConsumeClaim(
 			)
 
 			h.mu.Lock()
-			h.pending = append(h.pending, message)
+			h.pending = append(h.pending, pendingMessage{message: message, event: event})
 			shouldFlush := len(h.pending) >= h.batchSize
 			h.mu.Unlock()
 
 			if shouldFlush {
-				if err := h.flush(session); err != nil {
+				if err := h.flush(session, false); err != nil {
 					return err
 				}
 			}
 
 		case <-ticker.C:
-			if err := h.flush(session); err != nil {
+			if err := h.flush(session, true); err != nil {
 				h.log.Error("periodic stats refresh failed", "error", err)
 			}
 
 		case <-session.Context().Done():
-			return h.flush(session)
+			return h.flush(session, true)
 		}
 	}
 }
 
-func (h *groupHandler) flush(session sarama.ConsumerGroupSession) error {
+func (h *groupHandler) flush(session sarama.ConsumerGroupSession, periodic bool) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
-	if len(h.pending) == 0 {
+	now := time.Now().UTC()
+	refreshDue := h.lastRefresh.IsZero() || now.Sub(h.lastRefresh) >= h.analyticsInterval
+	if len(h.pending) == 0 && (!periodic || !refreshDue) {
 		return nil
 	}
 
-	windowTo := time.Now().UTC()
+	windowTo := now
 	windowFrom := windowTo.Add(-time.Hour)
-	if err := h.repository.RefreshStatsCache(session.Context(), windowFrom, windowTo); err != nil {
+	events := make([]domain.Event, 0, len(h.pending))
+	for _, pending := range h.pending {
+		events = append(events, pending.event)
+	}
+
+	if err := h.repository.StoreAnalyticsAndRefresh(
+		session.Context(),
+		events,
+		windowFrom,
+		windowTo,
+	); err != nil {
 		return fmt.Errorf("refresh stats before offset commit: %w", err)
 	}
 
-	for _, message := range h.pending {
-		session.MarkMessage(message, "")
+	for _, pending := range h.pending {
+		session.MarkMessage(pending.message, "")
 	}
-	session.Commit()
+	if len(h.pending) > 0 {
+		session.Commit()
+	}
 
 	h.log.Info(
-		"stats cache refreshed and offsets committed",
+		"stats cache refreshed",
 		"messages", len(h.pending),
+		"offsets_committed", len(h.pending) > 0,
 		"window_from", windowFrom,
 		"window_to", windowTo,
 	)
 	h.pending = nil
+	h.lastRefresh = windowTo
+	return nil
+}
+
+func (h *groupHandler) sendToDLQ(
+	session sarama.ConsumerGroupSession,
+	message *sarama.ConsumerMessage,
+	cause error,
+) error {
+	// An invalid message can follow valid messages in the same partition.
+	// Persist and commit those valid messages before advancing past the poison pill.
+	if err := h.flush(session, false); err != nil {
+		return fmt.Errorf("flush valid messages before DLQ: %w", err)
+	}
+
+	if err := h.dlq.SendDeadLetter(session.Context(), message, cause); err != nil {
+		return fmt.Errorf(
+			"send message at partition %d offset %d to DLQ: %w",
+			message.Partition,
+			message.Offset,
+			err,
+		)
+	}
+
+	session.MarkMessage(message, "")
+	session.Commit()
+	h.log.Warn(
+		"invalid Kafka message sent to DLQ",
+		"error", cause,
+		"key", string(message.Key),
+		"partition", message.Partition,
+		"offset", message.Offset,
+	)
+	return nil
+}
+
+func validateEvent(event domain.Event) error {
+	if event.EventID.String() == "00000000-0000-0000-0000-000000000000" {
+		return errors.New("event_id is required")
+	}
+	if event.UserID == "" {
+		return errors.New("user_id is required")
+	}
+	if _, ok := domain.ValidActions[event.Action]; !ok {
+		return fmt.Errorf("unknown action %q", event.Action)
+	}
+	if event.Timestamp.IsZero() {
+		return errors.New("timestamp is required")
+	}
 	return nil
 }

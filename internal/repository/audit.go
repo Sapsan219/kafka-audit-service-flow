@@ -2,6 +2,7 @@ package repository
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
@@ -18,21 +19,36 @@ func NewAuditRepository(pool *pgxpool.Pool) *AuditRepository {
 	return &AuditRepository{pool: pool}
 }
 
-func (r *AuditRepository) SaveEvent(ctx context.Context, event domain.Event) error {
-	_, err := r.pool.Exec(ctx, `
+func (r *AuditRepository) SaveEventWithOutbox(ctx context.Context, event domain.Event) error {
+	payload, err := json.Marshal(event)
+	if err != nil {
+		return fmt.Errorf("marshal outbox event: %w", err)
+	}
+
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin audit event transaction: %w", err)
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	if _, err := tx.Exec(ctx, `
 		INSERT INTO audit_log (event_id, user_id, action, resource_id, meta, timestamp)
 		VALUES ($1, $2, $3, $4, $5, $6)
-	`, event.EventID, event.UserID, event.Action, event.ResourceID, event.Meta, event.Timestamp)
-	if err != nil {
+	`, event.EventID, event.UserID, event.Action, event.ResourceID, event.Meta, event.Timestamp); err != nil {
 		return fmt.Errorf("insert audit event: %w", err)
 	}
-	return nil
-}
 
-func (r *AuditRepository) DeleteEvent(ctx context.Context, eventID string) error {
-	_, err := r.pool.Exec(ctx, `DELETE FROM audit_log WHERE event_id = $1`, eventID)
-	if err != nil {
-		return fmt.Errorf("delete audit event: %w", err)
+	if _, err := tx.Exec(ctx, `
+		INSERT INTO outbox_events (event_id, payload)
+		VALUES ($1, $2)
+	`, event.EventID, string(payload)); err != nil {
+		return fmt.Errorf("insert outbox event: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit audit event transaction: %w", err)
 	}
 	return nil
 }
@@ -73,7 +89,7 @@ func (r *AuditRepository) History(
 		SELECT event_id, user_id, action, resource_id, meta, timestamp
 		FROM audit_log
 		WHERE %s
-		ORDER BY timestamp DESC
+		ORDER BY timestamp DESC, event_id DESC
 		LIMIT $%d OFFSET $%d
 	`, where, len(args)-1, len(args))
 
@@ -154,8 +170,9 @@ func (r *AuditRepository) Stats(
 	return stats, nil
 }
 
-func (r *AuditRepository) RefreshStatsCache(
+func (r *AuditRepository) StoreAnalyticsAndRefresh(
 	ctx context.Context,
+	events []domain.Event,
 	from time.Time,
 	to time.Time,
 ) error {
@@ -167,6 +184,20 @@ func (r *AuditRepository) RefreshStatsCache(
 		_ = tx.Rollback(ctx)
 	}()
 
+	for _, event := range events {
+		if _, err := tx.Exec(ctx, `
+			INSERT INTO analytics_events (event_id, user_id, action, timestamp)
+			VALUES ($1, $2, $3, $4)
+			ON CONFLICT (event_id) DO NOTHING
+		`, event.EventID, event.UserID, event.Action, event.Timestamp); err != nil {
+			return fmt.Errorf("store analytics event %s: %w", event.EventID, err)
+		}
+	}
+
+	if _, err := tx.Exec(ctx, `DELETE FROM analytics_events WHERE timestamp < $1`, from); err != nil {
+		return fmt.Errorf("delete expired analytics events: %w", err)
+	}
+
 	if _, err := tx.Exec(ctx, `DELETE FROM stats_cache`); err != nil {
 		return fmt.Errorf("clear stats cache: %w", err)
 	}
@@ -174,7 +205,7 @@ func (r *AuditRepository) RefreshStatsCache(
 	if _, err := tx.Exec(ctx, `
 		INSERT INTO stats_cache (action, count, window_from, window_to, updated_at)
 		SELECT action, count(*), $1, $2, now()
-		FROM audit_log
+		FROM analytics_events
 		WHERE timestamp >= $1 AND timestamp < $2
 		GROUP BY action
 	`, from, to); err != nil {
@@ -187,35 +218,62 @@ func (r *AuditRepository) RefreshStatsCache(
 	return nil
 }
 
-func (r *AuditRepository) ReplaceStatsCache(
+func (r *AuditRepository) PendingOutbox(
 	ctx context.Context,
-	counts map[string]int64,
-	from time.Time,
-	to time.Time,
-) error {
-	tx, err := r.pool.Begin(ctx)
+	limit int,
+) ([]domain.Event, error) {
+	rows, err := r.pool.Query(ctx, `
+		SELECT payload
+		FROM outbox_events
+		WHERE published_at IS NULL
+		ORDER BY created_at, event_id
+		LIMIT $1
+	`, limit)
 	if err != nil {
-		return fmt.Errorf("begin replay stats transaction: %w", err)
+		return nil, fmt.Errorf("query pending outbox events: %w", err)
 	}
-	defer func() {
-		_ = tx.Rollback(ctx)
-	}()
+	defer rows.Close()
 
-	if _, err := tx.Exec(ctx, `DELETE FROM stats_cache`); err != nil {
-		return fmt.Errorf("clear replay stats cache: %w", err)
-	}
-
-	for action, count := range counts {
-		if _, err := tx.Exec(ctx, `
-			INSERT INTO stats_cache (action, count, window_from, window_to, updated_at)
-			VALUES ($1, $2, $3, $4, now())
-		`, action, count, from, to); err != nil {
-			return fmt.Errorf("insert replay stat for %s: %w", action, err)
+	events := make([]domain.Event, 0, limit)
+	for rows.Next() {
+		var payload json.RawMessage
+		if err := rows.Scan(&payload); err != nil {
+			return nil, fmt.Errorf("scan outbox payload: %w", err)
 		}
+		var event domain.Event
+		if err := json.Unmarshal(payload, &event); err != nil {
+			return nil, fmt.Errorf("decode outbox payload: %w", err)
+		}
+		events = append(events, event)
 	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate outbox events: %w", err)
+	}
+	return events, nil
+}
 
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit replay stats transaction: %w", err)
+func (r *AuditRepository) MarkOutboxPublished(ctx context.Context, eventID string) error {
+	if _, err := r.pool.Exec(ctx, `
+		UPDATE outbox_events
+		SET published_at = now(), attempts = attempts + 1, last_error = NULL
+		WHERE event_id = $1
+	`, eventID); err != nil {
+		return fmt.Errorf("mark outbox event published: %w", err)
+	}
+	return nil
+}
+
+func (r *AuditRepository) MarkOutboxFailed(
+	ctx context.Context,
+	eventID string,
+	message string,
+) error {
+	if _, err := r.pool.Exec(ctx, `
+		UPDATE outbox_events
+		SET attempts = attempts + 1, last_error = $2
+		WHERE event_id = $1
+	`, eventID, message); err != nil {
+		return fmt.Errorf("mark outbox event failed: %w", err)
 	}
 	return nil
 }

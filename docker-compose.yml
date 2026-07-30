@@ -1,7 +1,6 @@
 services:
   kafka:
     image: apache/kafka:3.7.0
-    container_name: kafka
     ports:
       - "9092:9092"
     environment:
@@ -33,26 +32,42 @@ services:
       - --create
       - --if-not-exists
       - --topic
-      - user-actions
+      - ${KAFKA_TOPIC:-user-actions}
       - --partitions
       - "3"
       - --replication-factor
       - "1"
 
+  kafka-dlq-init:
+    image: apache/kafka:3.7.0
+    depends_on:
+      kafka:
+        condition: service_healthy
+    command:
+      - /opt/kafka/bin/kafka-topics.sh
+      - --bootstrap-server
+      - kafka:29092
+      - --create
+      - --if-not-exists
+      - --topic
+      - ${KAFKA_DLQ_TOPIC:-user-actions-dlq}
+      - --partitions
+      - "3"
+      - --replication-factor
+      - "1"
 
   postgres:
     image: postgres:16
-    container_name: postgres
     ports:
-      - "5433:5432"
+      - "${POSTGRES_HOST_PORT:-5433}:5432"
     environment:
-      POSTGRES_DB: audit
-      POSTGRES_USER: audit
-      POSTGRES_PASSWORD: audit
+      POSTGRES_DB: ${POSTGRES_DB:-audit}
+      POSTGRES_USER: ${POSTGRES_USER:-audit}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-audit}
     volumes:
       - postgres_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U audit -d audit"]
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
       interval: 5s
       timeout: 3s
       retries: 10
@@ -64,7 +79,7 @@ services:
       postgres:
         condition: service_healthy
     environment:
-      PGPASSWORD: audit
+      PGPASSWORD: ${POSTGRES_PASSWORD:-audit}
     volumes:
       - ./migrations:/migrations:ro
     command:
@@ -74,11 +89,11 @@ services:
       - -h
       - postgres
       - -U
-      - audit
+      - ${POSTGRES_USER:-audit}
       - -d
-      - audit
+      - ${POSTGRES_DB:-audit}
       - -f
-      - /migrations/001_init.sql
+      - /migrations/001_create_audit_schema.sql
 
 volumes:
   postgres_data:

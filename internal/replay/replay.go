@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"sort"
 	"time"
 
@@ -12,15 +13,16 @@ import (
 	"github.com/IBM/sarama"
 )
 
-type StatsRepository interface {
-	ReplaceStatsCache(context.Context, map[string]int64, time.Time, time.Time) error
+type DeadLetterProducer interface {
+	SendDeadLetter(context.Context, *sarama.ConsumerMessage, error) error
 }
 
 type Replayer struct {
-	client     sarama.Client
-	consumer   sarama.Consumer
-	topic      string
-	repository StatsRepository
+	client   sarama.Client
+	consumer sarama.Consumer
+	topic    string
+	dlq      DeadLetterProducer
+	log      *slog.Logger
 }
 
 type partitionRange struct {
@@ -31,7 +33,8 @@ type partitionRange struct {
 func New(
 	brokers []string,
 	topic string,
-	repository StatsRepository,
+	dlq DeadLetterProducer,
+	log *slog.Logger,
 ) (*Replayer, error) {
 	cfg := sarama.NewConfig()
 	cfg.Version = sarama.V3_7_0_0
@@ -49,10 +52,11 @@ func New(
 	}
 
 	return &Replayer{
-		client:     client,
-		consumer:   consumer,
-		topic:      topic,
-		repository: repository,
+		client:   client,
+		consumer: consumer,
+		topic:    topic,
+		dlq:      dlq,
+		log:      log,
 	}, nil
 }
 
@@ -85,10 +89,8 @@ func (r *Replayer) Rebuild(
 		processed += partitionProcessed
 	}
 
-	if err := r.repository.ReplaceStatsCache(ctx, counts, from, to); err != nil {
-		return domain.ReplayResult{}, err
-	}
-
+	// Replay returns an independent historical result. It deliberately does
+	// not replace the rolling one-hour stats_cache maintained by the group.
 	return domain.ReplayResult{
 		EventsProcessed: processed,
 		Stats:           statsFromCounts(counts),
@@ -115,7 +117,14 @@ func (r *Replayer) replayPartition(
 		return 0, fmt.Errorf("consume replay partition %d: %w", partition, err)
 	}
 
-	processed, readErr := readPartition(ctx, partitionConsumer, offsets.end, from, to, counts)
+	processed, readErr := r.readPartition(
+		ctx,
+		partitionConsumer,
+		offsets.end,
+		from,
+		to,
+		counts,
+	)
 	if closeErr := partitionConsumer.Close(); readErr == nil && closeErr != nil {
 		readErr = closeErr
 	}
@@ -181,7 +190,7 @@ func statsFromCounts(counts map[string]int64) []domain.Stat {
 	return stats
 }
 
-func readPartition(
+func (r *Replayer) readPartition(
 	ctx context.Context,
 	partitionConsumer sarama.PartitionConsumer,
 	endOffset int64,
@@ -211,21 +220,49 @@ func readPartition(
 
 			var event domain.Event
 			if err := json.Unmarshal(message.Value, &event); err != nil {
-				return 0, fmt.Errorf("decode offset %d: %w", message.Offset, err)
-			}
-			if !event.Timestamp.Before(from) && event.Timestamp.Before(to) {
-				if _, ok := domain.ValidActions[event.Action]; !ok {
-					return 0, fmt.Errorf("unknown action %q at offset %d", event.Action, message.Offset)
+				if err := r.sendToDLQ(ctx, message, fmt.Errorf("decode JSON: %w", err)); err != nil {
+					return 0, err
 				}
+			} else if _, ok := domain.ValidActions[event.Action]; !ok {
+				if err := r.sendToDLQ(
+					ctx,
+					message,
+					fmt.Errorf("unknown action %q", event.Action),
+				); err != nil {
+					return 0, err
+				}
+			} else if !event.Timestamp.Before(from) && event.Timestamp.Before(to) {
 				counts[event.Action]++
 				processed++
 			}
 
-			// endOffset указывает на следующую позицию после последнего нужного
-			// сообщения, поэтому ожидать сообщение с самим endOffset не надо.
+			// endOffset points to the next position after the requested range.
 			if message.Offset+1 >= endOffset {
 				return processed, nil
 			}
 		}
 	}
+}
+
+func (r *Replayer) sendToDLQ(
+	ctx context.Context,
+	message *sarama.ConsumerMessage,
+	cause error,
+) error {
+	if err := r.dlq.SendDeadLetter(ctx, message, cause); err != nil {
+		return fmt.Errorf(
+			"send replay message at partition %d offset %d to DLQ: %w",
+			message.Partition,
+			message.Offset,
+			err,
+		)
+	}
+	r.log.Warn(
+		"invalid replay message sent to DLQ",
+		"error", cause,
+		"key", string(message.Key),
+		"partition", message.Partition,
+		"offset", message.Offset,
+	)
+	return nil
 }

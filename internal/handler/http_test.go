@@ -15,11 +15,7 @@ import (
 
 type stubEventRepository struct{}
 
-func (stubEventRepository) SaveEvent(context.Context, domain.Event) error {
-	return nil
-}
-
-func (stubEventRepository) DeleteEvent(context.Context, string) error {
+func (stubEventRepository) SaveEventWithOutbox(context.Context, domain.Event) error {
 	return nil
 }
 
@@ -32,12 +28,6 @@ func (stubEventRepository) History(
 
 func (stubEventRepository) Stats(context.Context, string, string) ([]domain.Stat, error) {
 	return nil, nil
-}
-
-type stubEventProducer struct{}
-
-func (stubEventProducer) SendEvent(context.Context, domain.Event) error {
-	return nil
 }
 
 func TestCreateAuditJSONBody(t *testing.T) {
@@ -65,7 +55,7 @@ func TestCreateAuditJSONBody(t *testing.T) {
 		},
 	}
 
-	auditService := service.NewAuditService(stubEventRepository{}, stubEventProducer{})
+	auditService := service.NewAuditService(stubEventRepository{})
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 	routes := New(auditService, nil, logger).Routes()
 
@@ -89,5 +79,27 @@ func TestCreateAuditJSONBody(t *testing.T) {
 				)
 			}
 		})
+	}
+}
+
+func TestStatsRequiresUserID(t *testing.T) {
+	t.Parallel()
+
+	auditService := service.NewAuditService(stubEventRepository{})
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	routes := New(auditService, nil, logger).Routes()
+
+	request := httptest.NewRequest(http.MethodGet, "/api/stats?group_by=action", nil)
+	response := httptest.NewRecorder()
+
+	routes.ServeHTTP(response, request)
+
+	if response.Code != http.StatusBadRequest {
+		t.Fatalf(
+			"status = %d, want %d; response = %s",
+			response.Code,
+			http.StatusBadRequest,
+			response.Body.String(),
+		)
 	}
 }

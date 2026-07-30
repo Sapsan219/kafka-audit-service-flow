@@ -55,11 +55,11 @@ func (h *Handler) createAudit(w http.ResponseWriter, r *http.Request) {
 	decoder := json.NewDecoder(http.MaxBytesReader(w, r.Body, 1<<20))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
-		writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
+		h.writeError(w, http.StatusBadRequest, "invalid JSON: "+err.Error())
 		return
 	}
 	if err := decoder.Decode(&struct{}{}); !errors.Is(err, io.EOF) {
-		writeError(w, http.StatusBadRequest, "request body must contain exactly one JSON object")
+		h.writeError(w, http.StatusBadRequest, "request body must contain exactly one JSON object")
 		return
 	}
 
@@ -72,22 +72,22 @@ func (h *Handler) createAudit(w http.ResponseWriter, r *http.Request) {
 	)
 	if err != nil {
 		if errors.Is(err, service.ErrValidation) {
-			writeError(w, http.StatusBadRequest, err.Error())
+			h.writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
 		h.log.Error("create audit event", "error", err)
-		writeError(w, http.StatusInternalServerError, "internal server error")
+		h.writeError(w, http.StatusInternalServerError, "internal server error")
 		return
 	}
 
-	writeJSON(w, http.StatusCreated, map[string]any{
+	h.writeJSON(w, http.StatusCreated, map[string]any{
 		"event_id":  event.EventID,
 		"timestamp": event.Timestamp,
 	})
 }
 
 func (h *Handler) health(w http.ResponseWriter, _ *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+	h.writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
 type historyItem struct {
@@ -102,23 +102,23 @@ func (h *Handler) auditHistory(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	page, err := positiveInt(query.Get("page"), 1)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "page must be a positive integer")
+		h.writeError(w, http.StatusBadRequest, "page must be a positive integer")
 		return
 	}
 	limit, err := positiveInt(query.Get("limit"), 50)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "limit must be a positive integer")
+		h.writeError(w, http.StatusBadRequest, "limit must be a positive integer")
 		return
 	}
 
 	from, err := optionalDate(query.Get("from"), false)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "from must have format YYYY-MM-DD")
+		h.writeError(w, http.StatusBadRequest, "from must have format YYYY-MM-DD")
 		return
 	}
 	toExclusive, err := optionalDate(query.Get("to"), true)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, "to must have format YYYY-MM-DD")
+		h.writeError(w, http.StatusBadRequest, "to must have format YYYY-MM-DD")
 		return
 	}
 
@@ -146,7 +146,7 @@ func (h *Handler) auditHistory(w http.ResponseWriter, r *http.Request) {
 		})
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	h.writeJSON(w, http.StatusOK, map[string]any{
 		"items": items,
 		"page":  page,
 		"limit": limit,
@@ -166,7 +166,7 @@ func (h *Handler) auditStats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	h.writeJSON(w, http.StatusOK, map[string]any{
 		"group_by": query.Get("group_by"),
 		"items":    stats,
 	})
@@ -176,27 +176,27 @@ func (h *Handler) rebuildStats(w http.ResponseWriter, r *http.Request) {
 	query := r.URL.Query()
 	from, err := optionalDate(query.Get("from"), false)
 	if err != nil || from == nil {
-		writeError(w, http.StatusBadRequest, "from is required and must have format YYYY-MM-DD")
+		h.writeError(w, http.StatusBadRequest, "from is required and must have format YYYY-MM-DD")
 		return
 	}
 	toExclusive, err := optionalDate(query.Get("to"), true)
 	if err != nil || toExclusive == nil {
-		writeError(w, http.StatusBadRequest, "to is required and must have format YYYY-MM-DD")
+		h.writeError(w, http.StatusBadRequest, "to is required and must have format YYYY-MM-DD")
 		return
 	}
 	if !from.Before(*toExclusive) {
-		writeError(w, http.StatusBadRequest, "from must not be after to")
+		h.writeError(w, http.StatusBadRequest, "from must not be after to")
 		return
 	}
 
 	result, err := h.replayer.Rebuild(r.Context(), *from, *toExclusive)
 	if err != nil {
 		h.log.Error("rebuild Kafka stats", "error", err)
-		writeError(w, http.StatusInternalServerError, "rebuild stats failed")
+		h.writeError(w, http.StatusInternalServerError, "rebuild stats failed")
 		return
 	}
 
-	writeJSON(w, http.StatusOK, map[string]any{
+	h.writeJSON(w, http.StatusOK, map[string]any{
 		"from":             from,
 		"to":               toExclusive.Add(-time.Nanosecond),
 		"events_processed": result.EventsProcessed,
@@ -206,11 +206,11 @@ func (h *Handler) rebuildStats(w http.ResponseWriter, r *http.Request) {
 
 func (h *Handler) handleServiceError(w http.ResponseWriter, err error, operation string) {
 	if errors.Is(err, service.ErrValidation) {
-		writeError(w, http.StatusBadRequest, err.Error())
+		h.writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
 	h.log.Error(operation, "error", err)
-	writeError(w, http.StatusInternalServerError, "internal server error")
+	h.writeError(w, http.StatusInternalServerError, "internal server error")
 }
 
 func positiveInt(value string, fallback int) (int, error) {
@@ -238,12 +238,14 @@ func optionalDate(value string, endOfDay bool) (*time.Time, error) {
 	return &date, nil
 }
 
-func writeJSON(w http.ResponseWriter, status int, value any) {
+func (h *Handler) writeJSON(w http.ResponseWriter, status int, value any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(value)
+	if err := json.NewEncoder(w).Encode(value); err != nil {
+		h.log.Error("encode HTTP response", "status", status, "error", err)
+	}
 }
 
-func writeError(w http.ResponseWriter, status int, message string) {
-	writeJSON(w, status, map[string]string{"error": message})
+func (h *Handler) writeError(w http.ResponseWriter, status int, message string) {
+	h.writeJSON(w, status, map[string]string{"error": message})
 }
